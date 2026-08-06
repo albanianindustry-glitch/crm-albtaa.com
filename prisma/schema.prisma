@@ -1,0 +1,501 @@
+// ═══════════════════════════════════════════════════════════════
+// Platform schema — Phase 1: Foundation
+//
+// Only `Business` and `StaffUser` are implemented in this phase.
+// Everything else (Contact, Submission, FormDefinition, Pipeline,
+// PipelineStage, ActivityLog, AccessToken, Document, EmailTemplate,
+// AutomationRule, Reminder, Note, Task) is added in later phases per
+// the approved roadmap. ActivityLog lands in Phase 2 — every model
+// added from Phase 2 onward writes to it as part of that phase, not
+// retrofitted later.
+//
+// Design constraint validated against TWO reference businesses
+// (ALBTAA — company registration/tax advisory, and LumineDent — a
+// dental practice) so nothing here is implicitly ALBTAA-shaped:
+//   - ALBTAA's pipeline: lead → docs pending → filed → registered
+//   - LumineDent's pipeline: inquiry → consult booked → treatment
+//     plan → in treatment → completed
+//   - ALBTAA's documents: passport, power of attorney
+//   - LumineDent's documents: insurance card, medical history form
+// Both fit the same `businessId`-scoped, config-driven shape.
+// ═══════════════════════════════════════════════════════════════
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Business — one row per business you own (ALBTAA, LumineDent, ...).
+// This is the single tenancy/isolation axis in the whole schema.
+// No provisioning workflow: rows are created via prisma/seed.ts or
+// a light internal script, never via public signup.
+// ─────────────────────────────────────────────────────────────
+model Business {
+  id             String   @id @default(cuid())
+  name           String // "ALBTAA", "LumineDent"
+  slug           String   @unique // "albtaa", "luminedent" — used in URLs (/admin/albtaa)
+  allowedOrigins String[] // website origins permitted to call the public API for this business
+  apiKeyHash     String   @unique // hashed API key the business's website authenticates with
+  notificationEmail String // where internal "new lead" notifications go
+  branding       Json // { logoUrl, primaryColor, senderName, senderEmail, ... }
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  staffUsers StaffUser[] @relation("StaffUserBusinesses")
+
+  contacts      Contact[]
+  forms         Form[]
+  submissions   Submission[]
+  activityLogs  ActivityLog[]
+  pipelines     Pipeline[]
+  pipelineStages PipelineStage[]
+  documentTypes DocumentType[]
+  documents     Document[]
+  emailTemplates EmailTemplate[]
+  emailLogs     EmailLog[]
+  reminders     Reminder[]
+  automationRules AutomationRule[]
+  notes         Note[]
+  tasks         Task[]
+
+  @@index([slug])
+}
+
+// ─────────────────────────────────────────────────────────────
+// StaffUser — your internal team. Flat role, not a per-business
+// permission matrix (this is an internal tool, not commercial SaaS).
+// `businesses` is optional-restrictive: empty list = sees every
+// business; non-empty = restricted to those listed. Defaults to
+// "sees everything" for a small team, per the open decision from
+// the roadmap discussion.
+// ─────────────────────────────────────────────────────────────
+model StaffUser {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  role         StaffRole @default(STAFF)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // If empty, this staff member can access all businesses.
+  businesses Business[] @relation("StaffUserBusinesses")
+
+  notes           Note[]
+  assignedTasks   Task[]
+
+  @@index([email])
+}
+
+enum StaffRole {
+  OWNER
+  STAFF
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Phase 2 — Lead Capture
+// ═══════════════════════════════════════════════════════════════
+
+// Contact — a real person, deduplicated per business by email. One
+// Contact can have many Submissions over time (multiple forms, or
+// the same form again later) and is what AccessToken (Phase 4)
+// attaches to.
+model Contact {
+  id        String   @id @default(cuid())
+  businessId String
+  business  Business @relation(fields: [businessId], references: [id])
+  email     String
+  firstName String
+  lastName  String
+  phone     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  submissions Submission[]
+  accessTokens AccessToken[]
+
+  @@unique([businessId, email])
+  @@index([businessId])
+}
+
+// Form — one per form on a business's website (e.g. "contact",
+// "register-company-albania"). FormVersion + FormField give stable,
+// queryable field identity and versioning without over-normalizing
+// per-field config (which stays as free-form Json on FormField).
+model Form {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id])
+  slug       String // "contact", "register-company-albania"
+  name       String // human label shown in admin
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  versions    FormVersion[]
+  submissions Submission[]
+
+  @@unique([businessId, slug])
+  @@index([businessId])
+}
+
+model FormVersion {
+  id            String   @id @default(cuid())
+  formId        String
+  form          Form     @relation(fields: [formId], references: [id])
+  versionNumber Int
+  publishedAt   DateTime @default(now())
+
+  fields      FormField[]
+  submissions Submission[]
+
+  @@unique([formId, versionNumber])
+  @@index([formId])
+}
+
+model FormField {
+  id            String      @id @default(cuid())
+  formVersionId String
+  formVersion   FormVersion @relation(fields: [formVersionId], references: [id])
+  key           String // stable identifier, e.g. "firstName", "service"
+  label         String
+  type          FormFieldType
+  order         Int
+  required      Boolean     @default(false)
+  // Type-specific config: select options, max length, placeholder,
+  // conditional-display rules, etc. Deliberately free-form here —
+  // this is the part of a form definition that genuinely varies per
+  // field type and gains nothing from further normalization.
+  config        Json        @default("{}")
+
+  @@unique([formVersionId, key])
+  @@index([formVersionId])
+}
+
+enum FormFieldType {
+  TEXT
+  EMAIL
+  PHONE
+  TEXTAREA
+  SELECT
+  CHECKBOX
+  HIDDEN
+}
+
+// Submission — one form submission event. Core identity fields live
+// on Contact; everything else specific to this submission (service
+// interested in, message, custom answers) stays as JSONB here rather
+// than an EAV table — see the frozen architecture review for why.
+model Submission {
+  id            String   @id @default(cuid())
+  businessId    String
+  business      Business @relation(fields: [businessId], references: [id])
+  contactId     String
+  contact       Contact  @relation(fields: [contactId], references: [id])
+  formId        String
+  form          Form     @relation(fields: [formId], references: [id])
+  formVersionId String
+  formVersion   FormVersion @relation(fields: [formVersionId], references: [id])
+
+  // Keyed by FormField.key (stable across form edits within a version).
+  customFields Json @default("{}")
+
+  // Attribution / source metadata captured at submission time.
+  sourceMeta Json @default("{}") // { referrer, pageUrl, utmSource, utmMedium, utmCampaign, userAgent }
+
+  currentStageId String?
+  currentStage   PipelineStage? @relation(fields: [currentStageId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  notes         Note[]
+  documents     Document[]
+  tasks         Task[]
+  accessTokens  AccessToken[]
+  reminders     Reminder[]
+  activityLogs  ActivityLog[]
+
+  @@index([businessId])
+  @@index([contactId])
+  @@index([currentStageId])
+  @@index([createdAt])
+}
+
+// ActivityLog — append-only event history. Written from Phase 2
+// onward by every meaningful write path (submission created, email
+// sent, later: stage changed, document uploaded, note added, task
+// completed...) even though the Timeline UI itself isn't built until
+// Phase 7. Nothing here is retrofitted later — the write path is
+// established now.
+model ActivityLog {
+  id           String     @id @default(cuid())
+  businessId   String
+  business     Business   @relation(fields: [businessId], references: [id])
+  submissionId String?
+  submission   Submission? @relation(fields: [submissionId], references: [id])
+
+  type      String // "submission.created" | "email.sent" | "stage.changed" | "note.added" | ...
+  payload   Json   @default("{}")
+
+  actorType ActivityActorType
+  actorId   String? // StaffUser.id when actorType = STAFF, null for SYSTEM/CLIENT
+
+  createdAt DateTime @default(now())
+
+  @@index([businessId])
+  @@index([submissionId])
+  @@index([createdAt])
+}
+
+enum ActivityActorType {
+  SYSTEM
+  STAFF
+  CLIENT
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Phase 3 — CRM (pipelines, stages, notes)
+// ═══════════════════════════════════════════════════════════════
+
+// Pipeline/PipelineStage are configuration, not a hardcoded enum —
+// each business defines its own stages (ALBTAA: lead -> docs pending
+// -> filed -> registered; LumineDent: inquiry -> consult booked ->
+// treatment plan -> in treatment -> completed).
+model Pipeline {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id])
+  name       String
+  isDefault  Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  stages PipelineStage[]
+
+  @@index([businessId])
+}
+
+model PipelineStage {
+  id         String   @id @default(cuid())
+  pipelineId String
+  pipeline   Pipeline @relation(fields: [pipelineId], references: [id])
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id])
+  key        String // "docs_pending" — referenced by AutomationRule triggers
+  label      String // "Documents Pending" — shown in UI
+  order      Int
+  isTerminal Boolean  @default(false)
+
+  submissions Submission[]
+
+  @@unique([pipelineId, key])
+  @@index([pipelineId])
+  @@index([businessId])
+}
+
+model Note {
+  id           String     @id @default(cuid())
+  businessId   String
+  business     Business   @relation(fields: [businessId], references: [id])
+  submissionId String
+  submission   Submission @relation(fields: [submissionId], references: [id])
+  authorId     String
+  author       StaffUser  @relation(fields: [authorId], references: [id])
+  body         String
+  createdAt    DateTime   @default(now())
+
+  @@index([submissionId])
+  @@index([businessId])
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Phase 4 — Client Portal
+// ═══════════════════════════════════════════════════════════════
+
+// AccessToken belongs to a Contact (a person), not a single
+// Submission, so one link can follow a client across multiple
+// interactions over time. Only the hash is stored; the raw token
+// lives only in the email sent to the client.
+model AccessToken {
+  id           String     @id @default(cuid())
+  contactId    String
+  contact      Contact    @relation(fields: [contactId], references: [id])
+  // Convenience pointer to the submission this token was generated
+  // for (drives the default portal view); the token itself is not
+  // scoped to only this submission going forward.
+  submissionId String?
+  submission   Submission? @relation(fields: [submissionId], references: [id])
+
+  tokenHash  String    @unique
+  createdAt  DateTime  @default(now())
+  expiresAt  DateTime? // null = never expires until manually revoked
+  revokedAt  DateTime?
+  lastUsedAt DateTime?
+  useCount   Int       @default(0)
+
+  @@index([contactId])
+  @@index([tokenHash])
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Phase 5 — Documents
+// ═══════════════════════════════════════════════════════════════
+
+// DocumentType is business-defined config, not a hardcoded enum
+// (ALBTAA: passport, power of attorney; LumineDent: insurance card,
+// medical history form).
+model DocumentType {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id])
+  key        String
+  label      String
+  isRequired Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  documents Document[]
+
+  @@unique([businessId, key])
+  @@index([businessId])
+}
+
+model Document {
+  id             String       @id @default(cuid())
+  businessId     String
+  business       Business     @relation(fields: [businessId], references: [id])
+  submissionId   String
+  submission     Submission   @relation(fields: [submissionId], references: [id])
+  documentTypeId String
+  documentType   DocumentType @relation(fields: [documentTypeId], references: [id])
+
+  storagePath String // Supabase Storage object path (not a public URL)
+  fileName    String
+  mimeType    String
+  sizeBytes   Int
+  status      DocumentStatus @default(PENDING)
+  uploadedAt  DateTime       @default(now())
+  reviewedAt  DateTime?
+  reviewNote  String?
+
+  @@index([submissionId])
+  @@index([businessId])
+}
+
+enum DocumentStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Phase 6 — Email Automation
+// ═══════════════════════════════════════════════════════════════
+
+model EmailTemplate {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id])
+  // Matches an ActivityLog.type / AutomationRule.eventTrigger value,
+  // e.g. "submission.created", "stage.changed:docs_pending".
+  triggerKey String
+  subject    String // supports {{variable}} interpolation
+  bodyHtml   String
+  bodyText   String
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([businessId, triggerKey])
+  @@index([businessId])
+}
+
+model EmailLog {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id])
+  contactId  String
+  triggerKey String
+  toEmail    String
+  subject    String
+  resendId   String?
+  sentAt     DateTime @default(now())
+
+  @@index([businessId])
+  @@index([contactId])
+}
+
+model Reminder {
+  id           String     @id @default(cuid())
+  businessId   String
+  business     Business   @relation(fields: [businessId], references: [id])
+  submissionId String
+  submission   Submission @relation(fields: [submissionId], references: [id])
+  triggerKey   String // which EmailTemplate to send when this fires
+  scheduledFor DateTime
+  sentAt       DateTime?
+  cancelledAt  DateTime?
+  createdAt    DateTime   @default(now())
+
+  @@index([businessId])
+  @@index([scheduledFor])
+}
+
+// AutomationRule — event -> optional conditions -> action. This is
+// deliberately NOT a full workflow engine/DSL; it covers the common
+// "when X happens (and matches Y), do Z" case with a schema shaped
+// so a fuller engine could be layered on later without migration.
+model AutomationRule {
+  id            String   @id @default(cuid())
+  businessId    String
+  business      Business @relation(fields: [businessId], references: [id])
+  name          String
+  eventTrigger  String // "submission.created", "document.uploaded", "stage.changed"
+  // Simple conditions evaluated against the event payload, e.g.
+  // { "stage.key": "docs_pending", "daysSinceStageChange": { "gte": 5 } }
+  conditions    Json     @default("{}")
+  actionType    AutomationActionType
+  actionConfig  Json // { templateKey } | { stageKey } | { taskTitle, dueInDays }
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([businessId])
+  @@index([eventTrigger])
+}
+
+enum AutomationActionType {
+  SEND_EMAIL
+  MOVE_STAGE
+  CREATE_TASK
+  SCHEDULE_REMINDER
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Phase 7 — Tasks & Timeline
+// (ActivityLog already defined in Phase 2 section above)
+// ═══════════════════════════════════════════════════════════════
+
+model Task {
+  id           String     @id @default(cuid())
+  businessId   String
+  business     Business   @relation(fields: [businessId], references: [id])
+  submissionId String
+  submission   Submission @relation(fields: [submissionId], references: [id])
+  assigneeId   String?
+  assignee     StaffUser? @relation(fields: [assigneeId], references: [id])
+  title        String
+  dueAt        DateTime?
+  completedAt  DateTime?
+  createdAt    DateTime   @default(now())
+
+  @@index([businessId])
+  @@index([submissionId])
+  @@index([assigneeId])
+}
