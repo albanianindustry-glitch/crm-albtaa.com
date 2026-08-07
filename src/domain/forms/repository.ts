@@ -21,5 +21,7 @@ export async function getActiveFormWithFields(businessId: string, formSlug: stri
   if (!form || form.versions.length === 0) return null;
 
   const latestVersion = form.versions[0];
+  if (!latestVersion) return null;
+
   return { form, formVersion: latestVersion, fields: latestVersion.fields };
 }
